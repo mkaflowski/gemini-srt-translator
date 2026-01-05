@@ -164,8 +164,43 @@ class GeminiSRTTranslator:
         self.consecutive_error_count = 0
         self.max_consecutive_errors = 5
         self.thought_signature = None
+        self.cache = None
+        self.min_cache_tokens = 32768  # Minimum for Gemini cache
 
         set_color_mode(use_colors)
+
+    def _create_or_skip_cache(self, system_instruction: str) -> bool:
+        """
+        Attempts to create a cache for system_instruction.
+        Returns True if cache created, False if not enough tokens.
+        """
+        client = self._get_client()
+
+        # Check token count
+        token_count = client.models.count_tokens(
+            model=self.model_name,
+            contents=[types.Content(role="user", parts=[types.Part(text=system_instruction)])]
+        )
+
+        if token_count.total_tokens < self.min_cache_tokens:
+            info(f"System instruction has {token_count.total_tokens} tokens "
+                 f"(minimum for cache: {self.min_cache_tokens}). Caching skipped.")
+            return False
+
+        try:
+            self.cache = client.caches.create(
+                model=self.model_name,
+                config=types.CreateCachedContentConfig(
+                    system_instruction=system_instruction,
+                    ttl="3600s",  # 1 hour
+                )
+            )
+            success(f"Cache created: {token_count.total_tokens} tokens. "
+                    f"Estimated savings: ~{token_count.total_tokens * self.batch_size} tokens for full translation.")
+            return True
+        except Exception as e:
+            warning(f"Failed to create cache: {e}. Continuing without caching.")
+            return False
 
     def _get_translate_config(self):
         """Get the configuration for the translation model."""
@@ -196,30 +231,65 @@ class GeminiSRTTranslator:
                 else:
                     self.thinking_level = "minimal"
 
-        return types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=get_translate_response_schema(),
-            safety_settings=get_safety_settings(),
-            temperature=self.temperature,
-            top_p=self.top_p,
-            top_k=self.top_k,
-            system_instruction=get_translate_instruction(
-                language=self.target_language,
-                thinking=self.thinking,
-                thinking_compatible=thinking_compatible,
-                audio_file=self.audio_file,
-                description=self.description,
-            ),
-            thinking_config=(
-                types.ThinkingConfig(
-                    include_thoughts=self.thinking,
-                    thinking_budget=self.thinking_budget,
-                    thinking_level=self.thinking_level,
-                )
-                if thinking_compatible
-                else None
-            ),
+        system_instruction = get_translate_instruction(
+            language=self.target_language,
+            thinking=self.thinking,
+            thinking_compatible=thinking_compatible,
+            audio_file=self.audio_file,
+            description=self.description,
         )
+
+        # If cache exists, don't add system_instruction to config
+        if self.cache:
+            return types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=get_translate_response_schema(),
+                safety_settings=get_safety_settings(),
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+                cached_content=self.cache.name,  # ← Use cache
+                thinking_config=(
+                    types.ThinkingConfig(
+                        include_thoughts=self.thinking,
+                        thinking_budget=self.thinking_budget,
+                        thinking_level=self.thinking_level,
+                    )
+                    if thinking_compatible
+                    else None
+                ),
+            )
+        else:
+            # Standard configuration without cache
+            return types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=get_translate_response_schema(),
+                safety_settings=get_safety_settings(),
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+                system_instruction=system_instruction,
+                thinking_config=(
+                    types.ThinkingConfig(
+                        include_thoughts=self.thinking,
+                        thinking_budget=self.thinking_budget,
+                        thinking_level=self.thinking_level,
+                    )
+                    if thinking_compatible
+                    else None
+                ),
+            )
+
+    def _cleanup_cache(self):
+        """Deletes cache after translation is complete."""
+        if self.cache:
+            try:
+                client = self._get_client()
+                client.caches.delete(name=self.cache.name)
+                info("Cache deleted.")
+            except Exception as e:
+                warning(f"Failed to delete cache: {e}")
+            self.cache = None
 
     def _get_transcribe_config(self):
         """Get the configuration for the transcription model."""
@@ -249,7 +319,7 @@ class GeminiSRTTranslator:
                     self.thinking_level = "low"
                 else:
                     self.thinking_level = "minimal"
-                    
+
         return types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=get_transcribe_response_schema(),
@@ -500,339 +570,361 @@ class GeminiSRTTranslator:
 
         self._get_token_limit()
 
-        with open(self.input_file, "r", encoding="utf-8") as original_file:
-            original_text = original_file.read()
-            original_subtitle = list(srt.parse(original_text))
-            try:
-                translated_file_exists = open(self.output_file, "r", encoding="utf-8")
-                translated_subtitle = list(srt.parse(translated_file_exists.read()))
-                if self.use_colors:
-                    info(
-                        f"Translated file \033[90m{self.output_file}\033[94m already exists. Loading existing translation...\n"
-                    )
-                else:
-                    info(f"Translated file {self.output_file} already exists. Loading existing translation...\n")
-                if self.start_line == None:
-                    while True:
-                        try:
-                            self.start_line = int(
-                                input_prompt(
-                                    f"Enter the line number to start from (1 to {len(original_subtitle)}): ",
-                                    mode="line",
-                                    max_length=len(original_subtitle),
-                                ).strip()
-                            )
-                            if self.start_line < 1 or self.start_line > len(original_subtitle):
-                                warning(
-                                    f"Line number must be between 1 and {len(original_subtitle)}. Please try again."
-                                )
-                                continue
-                            break
-                        except ValueError:
-                            warning("Invalid input. Please enter a valid number.")
+        # Attempt to create cache for system instruction
+        thinking_compatible = True
+        if "2.0" in self.model_name or "gemini" not in self.model_name:
+            thinking_compatible = False
 
-            except FileNotFoundError:
-                translated_subtitle = original_subtitle.copy()
-                self.start_line = 1
+        system_instruction = get_translate_instruction(
+            language=self.target_language,
+            thinking=self.thinking,
+            thinking_compatible=thinking_compatible,
+            audio_file=self.audio_file,
+            description=self.description,
+        )
+        self._create_or_skip_cache(system_instruction)
 
-            if len(original_subtitle) != len(translated_subtitle):
-                error(
-                    f"Number of lines of existing translated file does not match the number of lines in the original file.",
-                    ignore_quiet=True,
-                )
-                exit(1)
-
-            translated_file = open(self.output_file, "w", encoding="utf-8")
-
-            if self.start_line > len(original_subtitle) or self.start_line < 1:
-                error(
-                    f"Start line must be between 1 and {len(original_subtitle)}. Please try again.", ignore_quiet=True
-                )
-                exit(1)
-
-            if len(original_subtitle) < self.batch_size:
-                self.batch_size = len(original_subtitle)
-
-            delay = False
-            delay_time = 30
-
-            if "pro" in self.model_name and self.free_quota:
-                delay = True
-                if not self.gemini_api_key2:
-                    info("Pro model and free user quota detected.\n")
-                else:
-                    delay_time = 15
+        try:
+            with open(self.input_file, "r", encoding="utf-8") as original_file:
+                original_text = original_file.read()
+                original_subtitle = list(srt.parse(original_text))
+                try:
+                    translated_file_exists = open(self.output_file, "r", encoding="utf-8")
+                    translated_subtitle = list(srt.parse(translated_file_exists.read()))
                     if self.use_colors:
-                        info("\033[33mPro model and free user quota detected, using secondary API key if needed.\n")
+                        info(
+                            f"Translated file \033[90m{self.output_file}\033[94m already exists. Loading existing translation...\n"
+                        )
                     else:
-                        info("Pro model and free user quota detected, using secondary API key if needed.\n")
-
-            i = self.start_line - 1
-            total = len(original_subtitle)
-            batch = []
-            previous_message = []
-            if self.start_line > 1:
-                start_idx = max(0, self.start_line - 2 - self.batch_size)
-                parts_user = []
-                subtitle_array: list[SubtitleObject] = []
-                offset = 0
-                for j in range(start_idx, self.start_line - 1):
-                    if j == 0:
-                        offset = original_subtitle[j].start.seconds
-                    subtitle_kwargs = {
-                        "index": str(j),
-                        "text": original_subtitle[j].content,
-                    }
-                    if self.audio_file:
-                        subtitle_kwargs["time_start"] = convert_timedelta_to_timestamp(
-                            original_subtitle[j].start, offset=offset
-                        )
-                        subtitle_kwargs["time_end"] = convert_timedelta_to_timestamp(
-                            original_subtitle[j].end, offset=offset
-                        )
-                    subtitle_array.append(SubtitleObject(**subtitle_kwargs))
-
-                parts_user.append(
-                    types.Part(
-                        text=json.dumps(
-                            subtitle_array,
-                            ensure_ascii=False,
-                        ),
-                    )
-                )
-
-                parts_model = []
-                parts_model.append(
-                    types.Part(
-                        text=json.dumps(
-                            [
-                                SubtitleObject(
-                                    index=str(j),
-                                    text=translated_subtitle[j].content,
+                        info(f"Translated file {self.output_file} already exists. Loading existing translation...\n")
+                    if self.start_line == None:
+                        while True:
+                            try:
+                                self.start_line = int(
+                                    input_prompt(
+                                        f"Enter the line number to start from (1 to {len(original_subtitle)}): ",
+                                        mode="line",
+                                        max_length=len(original_subtitle),
+                                    ).strip()
                                 )
-                                for j in range(start_idx, self.start_line - 1)
-                            ],
-                            ensure_ascii=False,
-                        )
+                                if self.start_line < 1 or self.start_line > len(original_subtitle):
+                                    warning(
+                                        f"Line number must be between 1 and {len(original_subtitle)}. Please try again."
+                                    )
+                                    continue
+                                break
+                            except ValueError:
+                                warning("Invalid input. Please enter a valid number.")
+
+                except FileNotFoundError:
+                    translated_subtitle = original_subtitle.copy()
+                    self.start_line = 1
+
+                if len(original_subtitle) != len(translated_subtitle):
+                    error(
+                        f"Number of lines of existing translated file does not match the number of lines in the original file.",
+                        ignore_quiet=True,
                     )
-                )
+                    exit(1)
 
-                previous_message = [
-                    types.Content(
-                        role="user",
-                        parts=parts_user,
-                    ),
-                    types.Content(
-                        role="model",
-                        parts=parts_model,
-                    ),
-                ]
+                translated_file = open(self.output_file, "w", encoding="utf-8")
 
-            highlight(f"Starting translation of {total - self.start_line + 1} lines...\n")
-            if self.use_colors:
-                progress_bar(i, total, prefix="Translating:", suffix=f"\033[31m{self.model_name}", isSending=True)
-            else:
-                progress_bar(i, total, prefix="Translating:", suffix=f"{self.model_name}", isSending=True)
+                if self.start_line > len(original_subtitle) or self.start_line < 1:
+                    error(
+                        f"Start line must be between 1 and {len(original_subtitle)}. Please try again.",
+                        ignore_quiet=True
+                    )
+                    exit(1)
 
-            if self.gemini_api_key2:
-                if self.use_colors:
-                    info(f"Starting with \033[31mAPI Key {self.current_api_number}")
-                else:
-                    info(f"Starting with API Key {self.current_api_number}")
+                if len(original_subtitle) < self.batch_size:
+                    self.batch_size = len(original_subtitle)
 
-            def handle_interrupt(signal_received, frame):
-                last_chunk_size = get_last_chunk_size()
-                warning_with_progress(
-                    f"Translation interrupted. Saving partial results to file. Progress saved.",
-                    chunk_size=max(0, last_chunk_size - 1),
-                )
-                if translated_file:
-                    translated_file.write(srt.compose(translated_subtitle, reindex=False, strict=False))
-                    translated_file.close()
-                if self.progress_log:
-                    save_logs_to_file(self.log_file_path)
-                self._save_progress(max(1, i - len(batch) + max(0, last_chunk_size - 1) + 1))
-                exit(0)
+                delay = False
+                delay_time = 30
 
-            signal.signal(signal.SIGINT, handle_interrupt)
+                if "pro" in self.model_name and self.free_quota:
+                    delay = True
+                    if not self.gemini_api_key2:
+                        info("Pro model and free user quota detected.\n")
+                    else:
+                        delay_time = 15
+                        if self.use_colors:
+                            info("\033[33mPro model and free user quota detected, using secondary API key if needed.\n")
+                        else:
+                            info("Pro model and free user quota detected, using secondary API key if needed.\n")
 
-            self._save_progress(i)
-
-            last_time = 0
-            validated = False
-            offset = 0
-            offset_end = 0
-            server_overload_retries = 0
-            max_overload_retries = 3
-
-            while i < total or len(batch) > 0:
-                if i < total and len(batch) < self.batch_size:
-                    if offset_end - offset < self.audio_chunk_size:
+                i = self.start_line - 1
+                total = len(original_subtitle)
+                batch = []
+                previous_message = []
+                if self.start_line > 1:
+                    start_idx = max(0, self.start_line - 2 - self.batch_size)
+                    parts_user = []
+                    subtitle_array: list[SubtitleObject] = []
+                    offset = 0
+                    for j in range(start_idx, self.start_line - 1):
+                        if j == 0:
+                            offset = original_subtitle[j].start.seconds
                         subtitle_kwargs = {
-                            "index": str(i),
-                            "text": original_subtitle[i].content,
+                            "index": str(j),
+                            "text": original_subtitle[j].content,
                         }
                         if self.audio_file:
-                            if len(batch) == 0:
-                                offset = original_subtitle[i].start.seconds
                             subtitle_kwargs["time_start"] = convert_timedelta_to_timestamp(
-                                original_subtitle[i].start, offset=offset
+                                original_subtitle[j].start, offset=offset
                             )
                             subtitle_kwargs["time_end"] = convert_timedelta_to_timestamp(
-                                original_subtitle[i].end, offset=offset
+                                original_subtitle[j].end, offset=offset
                             )
-                            offset_end = original_subtitle[i].end.seconds
-                        batch.append(SubtitleObject(**subtitle_kwargs))
-                        i += 1
-                        continue
-                    else:
-                        if batch:
-                            i -= 1
-                            offset_end = original_subtitle[i].end.seconds
-                            batch.pop()
-                try:
-                    while not validated:
-                        info_with_progress(f"Validating token size...")
-                        try:
-                            validated = self._validate_token_size(json.dumps(batch, ensure_ascii=False))
-                        except Exception as e:
-                            error_with_progress(f"Error validating token size: {e}")
-                            info_with_progress(f"Retrying validation...")
-                            continue
-                        if not validated:
-                            error_with_progress(
-                                f"Token size ({int(self.token_count/0.9)}) exceeds limit ({self.token_limit}) for {self.model_name}."
-                            )
-                            user_prompt = "0"
-                            while not user_prompt.isdigit() or int(user_prompt) <= 0:
-                                user_prompt = input_prompt_with_progress(
-                                    f"Please enter a new batch size (current: {self.batch_size}): ",
-                                    batch_size=self.batch_size,
-                                )
-                                if user_prompt.isdigit() and int(user_prompt) > 0:
-                                    new_batch_size = int(user_prompt)
-                                    decrement = self.batch_size - new_batch_size
-                                    if decrement > 0:
-                                        for _ in range(decrement):
-                                            i -= 1
-                                            batch.pop()
-                                    self.batch_size = new_batch_size
-                                    info_with_progress(f"Batch size updated to {self.batch_size}.")
-                                else:
-                                    warning_with_progress("Invalid input. Batch size must be a positive integer.")
-                            continue
-                        success_with_progress(f"Token size validated. Translating...", isSending=True)
+                        subtitle_array.append(SubtitleObject(**subtitle_kwargs))
 
-                    if i == total and len(batch) < self.batch_size:
-                        self.batch_size = len(batch)
-
-                    if self.audio:
-                        audio_bytes = self.audio[offset * 1000 : offset_end * 1000].export(format="mp3").read()
-                        self.audio_part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/mp3")
-
-                    start_time = time.time()
-                    previous_message = self._process_batch(batch, previous_message, translated_subtitle)
-                    end_time = time.time()
-                    offset = offset_end
-
-                    server_overload_retries = 0
-                    self.consecutive_error_count = 0
-
-                    progress_bar(
-                        i,
-                        total,
-                        prefix="Translating:",
-                        suffix=f"\033[31m{self.model_name}" if self.use_colors else f"{self.model_name}",
-                        isSending=True,
-                    )
-
-                    self._save_progress(i + 1)
-
-                    if delay and (end_time - start_time < delay_time) and i < total:
-                        time.sleep(delay_time - (end_time - start_time))
-
-                except Exception as e:
-                    self.consecutive_error_count += 1
-                    warning_with_progress(
-                        f"Consecutive error count: {self.consecutive_error_count}/{self.max_consecutive_errors}"
-                    )
-
-                    if self.consecutive_error_count >= self.max_consecutive_errors:
-                        error_with_progress(
-                            f"Stopping script due to reaching {self.max_consecutive_errors} consecutive errors to prevent API quota waste."
+                    parts_user.append(
+                        types.Part(
+                            text=json.dumps(
+                                subtitle_array,
+                                ensure_ascii=False,
+                            ),
                         )
-                        signal.raise_signal(signal.SIGINT)
-                        time.sleep(2)
+                    )
 
-                    e_str = str(e).lower()
-
-                    if "quota" in e_str:
-                        current_time = time.time()
-                        if current_time - last_time > 60 and self._switch_api():
-                            highlight_with_progress(
-                                f"API {self.backup_api_number} quota exceeded! Switching to API {self.current_api_number}...",
-                                isSending=True,
+                    parts_model = []
+                    parts_model.append(
+                        types.Part(
+                            text=json.dumps(
+                                [
+                                    SubtitleObject(
+                                        index=str(j),
+                                        text=translated_subtitle[j].content,
+                                    )
+                                    for j in range(start_idx, self.start_line - 1)
+                                ],
+                                ensure_ascii=False,
                             )
-                        else:
-                            for j in range(60, 0, -1):
-                                warning_with_progress(f"All API quotas exceeded, waiting {j} seconds...")
-                                time.sleep(1)
-                        last_time = current_time
-                        continue
+                        )
+                    )
 
-                    elif any(err in e_str for err in ["500", "503", "unavailable", "overloaded"]):
-                        server_overload_retries += 1
-                        if server_overload_retries <= max_overload_retries:
-                            warning_with_progress(
-                                f"Model is overloaded ({e_str}). Attempt {server_overload_retries}/{max_overload_retries}. Pausing for 3 minutes..."
-                            )
-                            time.sleep(180)
-                            info_with_progress("Resuming translation...", isSending=True)
+                    previous_message = [
+                        types.Content(
+                            role="user",
+                            parts=parts_user,
+                        ),
+                        types.Content(
+                            role="model",
+                            parts=parts_model,
+                        ),
+                    ]
+
+                highlight(f"Starting translation of {total - self.start_line + 1} lines...\n")
+                if self.use_colors:
+                    progress_bar(i, total, prefix="Translating:", suffix=f"\033[31m{self.model_name}", isSending=True)
+                else:
+                    progress_bar(i, total, prefix="Translating:", suffix=f"{self.model_name}", isSending=True)
+
+                if self.gemini_api_key2:
+                    if self.use_colors:
+                        info(f"Starting with \033[31mAPI Key {self.current_api_number}")
+                    else:
+                        info(f"Starting with API Key {self.current_api_number}")
+
+                def handle_interrupt(signal_received, frame):
+                    last_chunk_size = get_last_chunk_size()
+                    warning_with_progress(
+                        f"Translation interrupted. Saving partial results to file. Progress saved.",
+                        chunk_size=max(0, last_chunk_size - 1),
+                    )
+                    if translated_file:
+                        translated_file.write(srt.compose(translated_subtitle, reindex=False, strict=False))
+                        translated_file.close()
+                    if self.progress_log:
+                        save_logs_to_file(self.log_file_path)
+                    self._save_progress(max(1, i - len(batch) + max(0, last_chunk_size - 1) + 1))
+                    self._cleanup_cache()  # Cleanup cache on interrupt
+                    exit(0)
+
+                signal.signal(signal.SIGINT, handle_interrupt)
+
+                self._save_progress(i)
+
+                last_time = 0
+                validated = False
+                offset = 0
+                offset_end = 0
+                server_overload_retries = 0
+                max_overload_retries = 3
+
+                while i < total or len(batch) > 0:
+                    if i < total and len(batch) < self.batch_size:
+                        if offset_end - offset < self.audio_chunk_size:
+                            subtitle_kwargs = {
+                                "index": str(i),
+                                "text": original_subtitle[i].content,
+                            }
+                            if self.audio_file:
+                                if len(batch) == 0:
+                                    offset = original_subtitle[i].start.seconds
+                                subtitle_kwargs["time_start"] = convert_timedelta_to_timestamp(
+                                    original_subtitle[i].start, offset=offset
+                                )
+                                subtitle_kwargs["time_end"] = convert_timedelta_to_timestamp(
+                                    original_subtitle[i].end, offset=offset
+                                )
+                                offset_end = original_subtitle[i].end.seconds
+                            batch.append(SubtitleObject(**subtitle_kwargs))
+                            i += 1
                             continue
                         else:
+                            if batch:
+                                i -= 1
+                                offset_end = original_subtitle[i].end.seconds
+                                batch.pop()
+                    try:
+                        while not validated:
+                            info_with_progress(f"Validating token size...")
+                            try:
+                                validated = self._validate_token_size(json.dumps(batch, ensure_ascii=False))
+                            except Exception as e:
+                                error_with_progress(f"Error validating token size: {e}")
+                                info_with_progress(f"Retrying validation...")
+                                continue
+                            if not validated:
+                                error_with_progress(
+                                    f"Token size ({int(self.token_count / 0.9)}) exceeds limit ({self.token_limit}) for {self.model_name}."
+                                )
+                                user_prompt = "0"
+                                while not user_prompt.isdigit() or int(user_prompt) <= 0:
+                                    user_prompt = input_prompt_with_progress(
+                                        f"Please enter a new batch size (current: {self.batch_size}): ",
+                                        batch_size=self.batch_size,
+                                    )
+                                    if user_prompt.isdigit() and int(user_prompt) > 0:
+                                        new_batch_size = int(user_prompt)
+                                        decrement = self.batch_size - new_batch_size
+                                        if decrement > 0:
+                                            for _ in range(decrement):
+                                                i -= 1
+                                                batch.pop()
+                                        self.batch_size = new_batch_size
+                                        info_with_progress(f"Batch size updated to {self.batch_size}.")
+                                    else:
+                                        warning_with_progress("Invalid input. Batch size must be a positive integer.")
+                                continue
+                            success_with_progress(f"Token size validated. Translating...", isSending=True)
+
+                        if i == total and len(batch) < self.batch_size:
+                            self.batch_size = len(batch)
+
+                        if self.audio:
+                            audio_bytes = self.audio[offset * 1000: offset_end * 1000].export(format="mp3").read()
+                            self.audio_part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/mp3")
+
+                        start_time = time.time()
+                        previous_message = self._process_batch(batch, previous_message, translated_subtitle)
+                        end_time = time.time()
+                        offset = offset_end
+
+                        server_overload_retries = 0
+                        self.consecutive_error_count = 0
+
+                        progress_bar(
+                            i,
+                            total,
+                            prefix="Translating:",
+                            suffix=f"\033[31m{self.model_name}" if self.use_colors else f"{self.model_name}",
+                            isSending=True,
+                        )
+
+                        self._save_progress(i + 1)
+
+                        if delay and (end_time - start_time < delay_time) and i < total:
+                            time.sleep(delay_time - (end_time - start_time))
+
+                    except Exception as e:
+                        self.consecutive_error_count += 1
+                        warning_with_progress(
+                            f"Consecutive error count: {self.consecutive_error_count}/{self.max_consecutive_errors}"
+                        )
+
+                        if self.consecutive_error_count >= self.max_consecutive_errors:
                             error_with_progress(
-                                f"Model is still overloaded after {max_overload_retries} attempts. Aborting."
+                                f"Stopping script due to reaching {self.max_consecutive_errors} consecutive errors to prevent API quota waste."
                             )
                             signal.raise_signal(signal.SIGINT)
+                            time.sleep(2)
 
-                    else:
-                        if isinstance(e, json.decoder.JSONDecodeError):
-                            warning_with_progress(f"JSON response error.")
-                        elif "line" in str(e):
-                            warning_with_progress(f"{e}")
+                        e_str = str(e).lower()
+
+                        if "quota" in e_str:
+                            current_time = time.time()
+                            if current_time - last_time > 60 and self._switch_api():
+                                highlight_with_progress(
+                                    f"API {self.backup_api_number} quota exceeded! Switching to API {self.current_api_number}...",
+                                    isSending=True,
+                                )
+                            else:
+                                for j in range(60, 0, -1):
+                                    warning_with_progress(f"All API quotas exceeded, waiting {j} seconds...")
+                                    time.sleep(1)
+                            last_time = current_time
+                            continue
+
+                        elif any(err in e_str for err in ["500", "503", "unavailable", "overloaded"]):
+                            server_overload_retries += 1
+                            if server_overload_retries <= max_overload_retries:
+                                warning_with_progress(
+                                    f"Model is overloaded ({e_str}). Attempt {server_overload_retries}/{max_overload_retries}. Pausing for 3 minutes..."
+                                )
+                                time.sleep(180)
+                                info_with_progress("Resuming translation...", isSending=True)
+                                continue
+                            else:
+                                error_with_progress(
+                                    f"Model is still overloaded after {max_overload_retries} attempts. Aborting."
+                                )
+                                signal.raise_signal(signal.SIGINT)
+
                         else:
-                            warning_with_progress(f"An unexpected error occurred: {e}.")
+                            if isinstance(e, json.decoder.JSONDecodeError):
+                                warning_with_progress(f"JSON response error.")
+                            elif "line" in str(e):
+                                warning_with_progress(f"{e}")
+                            else:
+                                warning_with_progress(f"An unexpected error occurred: {e}.")
 
-                        start_index_in_batch = int(batch[0]["index"]) + 1
-                        end_index_in_batch = int(batch[-1]["index"]) + 1
-                        info_with_progress(
-                            f"Retrying batch for lines {start_index_in_batch}-{end_index_in_batch}...", isSending=True
-                        )
+                            start_index_in_batch = int(batch[0]["index"]) + 1
+                            end_index_in_batch = int(batch[-1]["index"]) + 1
+                            info_with_progress(
+                                f"Retrying batch for lines {start_index_in_batch}-{end_index_in_batch}...",
+                                isSending=True
+                            )
 
-                        time.sleep(5)
+                            time.sleep(5)
 
-                        if self.progress_log:
-                            save_logs_to_file(self.log_file_path)
+                            if self.progress_log:
+                                save_logs_to_file(self.log_file_path)
 
-                        continue
+                            continue
 
-            if self.use_colors:
-                success_with_progress("\n\033[96m✅ \033[96mTranslation completed successfully!")
-            else:
-                success_with_progress("\n✅ Translation completed successfully!")
-            if self.progress_log:
-                save_logs_to_file(self.log_file_path)
-            translated_file.write(srt.compose(translated_subtitle, reindex=False, strict=False))
-            translated_file.close()
+                if self.use_colors:
+                    success_with_progress("\n\033[96m✅ \033[96mTranslation completed successfully!")
+                else:
+                    success_with_progress("\n✅ Translation completed successfully!")
+                if self.progress_log:
+                    save_logs_to_file(self.log_file_path)
+                translated_file.write(srt.compose(translated_subtitle, reindex=False, strict=False))
+                translated_file.close()
 
-            if self.audio_file and os.path.exists(self.audio_file) and self.audio_extracted:
-                os.remove(self.audio_file)
+                if self.audio_file and os.path.exists(self.audio_file) and self.audio_extracted:
+                    os.remove(self.audio_file)
 
-            if self.progress_file and os.path.exists(self.progress_file):
-                os.remove(self.progress_file)
+                if self.progress_file and os.path.exists(self.progress_file):
+                    os.remove(self.progress_file)
 
-        if self.srt_extracted and os.path.exists(self.input_file):
-            os.remove(self.input_file)
+            if self.srt_extracted and os.path.exists(self.input_file):
+                os.remove(self.input_file)
+
+        finally:
+            # Always cleanup cache at the end
+            self._cleanup_cache()
 
     def _switch_api(self) -> bool:
         """
@@ -934,6 +1026,12 @@ class GeminiSRTTranslator:
                 response = client.models.generate_content(
                     model=self.model_name, contents=contents, config=self._get_translate_config()
                 )
+
+                if response.usage_metadata:
+                    print(f"Prompt tokens: {response.usage_metadata.prompt_token_count}")
+                    print(f"Cached tokens: {getattr(response.usage_metadata, 'cached_content_token_count', 0)}")
+                    print(f"Response tokens: {response.usage_metadata.candidates_token_count}")
+
                 if response.prompt_feedback:
                     blocked = True
                     break
@@ -964,6 +1062,7 @@ class GeminiSRTTranslator:
                 response = client.models.generate_content_stream(
                     model=self.model_name, contents=contents, config=self._get_translate_config()
                 )
+
                 for chunk in response:
                     if chunk.prompt_feedback:
                         blocked = True
@@ -1141,7 +1240,7 @@ class GeminiSRTTranslator:
                 ignore_quiet=True,
             )
             exit(1)
-        
+
         if self.thinking_budget is not None:
             if "gemini" in self.model_name:
                 if "3" in self.model_name or "2.0" in self.model_name:
@@ -1152,7 +1251,7 @@ class GeminiSRTTranslator:
                 elif "pro" in self.model_name and (self.thinking_budget < 128 or self.thinking_budget > 32768):
                     error("Thinking budget must be between 128 and 32768.", ignore_quiet=True)
                     exit(1)
-        
+
         if self.thinking_level is not None and "gemini-3" in self.model_name:
             if self.thinking_level != "minimal" and self.thinking_level != "low" and self.thinking_level != "medium" and self.thinking_level != "high":
                 error("Thinking level must be 'minimal', 'low', 'medium', or 'high'.", ignore_quiet=True)
